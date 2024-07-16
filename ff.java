@@ -1,15 +1,13 @@
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.security.oauth2.client.registration.ClientRegistration;
-import org.springframework.security.oauth2.client.registration.ClientRegistrationRepository;
-import org.springframework.security.oauth2.client.registration.InMemoryClientRegistrationRepository;
-import org.springframework.security.oauth2.client.web.DefaultOAuth2AuthorizedClientManager;
-import org.springframework.security.oauth2.client.web.OAuth2AuthorizedClientManager;
-import org.springframework.security.oauth2.client.web.OAuth2AuthorizedClientRepository;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
 
-@Configuration
-public class OAuth2ClientConfig {
+@Service
+public class OAuth2TokenService {
 
     @Value("${spring.security.oauth2.client.provider.custom.token-uri}")
     private String tokenUri;
@@ -20,107 +18,79 @@ public class OAuth2ClientConfig {
     @Value("${spring.security.oauth2.client.registration.custom.client-secret}")
     private String clientSecret;
 
-    @Bean
-    public ClientRegistrationRepository clientRegistrationRepository() {
-        ClientRegistration clientRegistration = ClientRegistration.withRegistrationId("custom")
-                .tokenUri(tokenUri)
-                .clientId(clientId)
-                .clientSecret(clientSecret)
-                .authorizationGrantType(AuthorizationGrantType.CLIENT_CREDENTIALS)
-                .build();
-        return new InMemoryClientRegistrationRepository(clientRegistration);
+    private final WebClient webClient;
+
+    public OAuth2TokenService(WebClient.Builder webClientBuilder) {
+        this.webClient = webClientBuilder.build();
     }
 
-    @Bean
-    public OAuth2AuthorizedClientManager authorizedClientManager(
-            ClientRegistrationRepository clientRegistrationRepository,
-            OAuth2AuthorizedClientRepository authorizedClientRepository) {
-
-        DefaultOAuth2AuthorizedClientManager authorizedClientManager = 
-                new DefaultOAuth2AuthorizedClientManager(
-                        clientRegistrationRepository, authorizedClientRepository);
-
-        authorizedClientManager.setAuthorizedClientProvider(
-                OAuth2AuthorizedClientProviderBuilder.builder()
-                        .clientCredentials()
-                        .build());
-
-        return authorizedClientManager;
+    public Mono<String> getToken() {
+        return webClient.post()
+                .uri(tokenUri)
+                .bodyValue(createTokenRequestBody())
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(this::parseTokenFromResponse);
     }
-}
 
-
-
-
-
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.security.oauth2.client.endpoint.DefaultClientCredentialsTokenResponseClient;
-import org.springframework.security.oauth2.client.endpoint.OAuth2AccessTokenResponseClient;
-import org.springframework.security.oauth2.client.endpoint.OAuth2ClientCredentialsGrantRequest;
-import org.springframework.security.oauth2.core.OAuth2AccessToken;
-import org.springframework.security.oauth2.core.endpoint.OAuth2AccessTokenResponse;
-import org.springframework.security.oauth2.core.endpoint.OAuth2ParameterNames;
-import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
-import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Mono;
-
-import java.util.HashMap;
-import java.util.Map;
-
-@Configuration
-public class CustomOAuth2ClientConfig {
-
-    @Bean
-    public WebClient customWebClient() {
-        return WebClient.builder()
-                .filter(ExchangeFilterFunction.ofResponseProcessor(clientResponse -> {
-                    return clientResponse.bodyToMono(String.class)
-                            .map(responseBody -> {
-                                // Custom parsing logic for non-JSON response
-                                String tokenValue = parseTokenFromResponse(responseBody);
-                                Map<String, Object> additionalParameters = new HashMap<>();
-                                additionalParameters.put(OAuth2ParameterNames.ACCESS_TOKEN, tokenValue);
-                                return OAuth2AccessTokenResponse.withToken(tokenValue)
-                                        .tokenType(OAuth2AccessToken.TokenType.BEARER)
-                                        .additionalParameters(additionalParameters)
-                                        .build();
-                            })
-                            .flatMap(accessTokenResponse -> Mono.just(clientResponse));
-                }))
-                .build();
+    private Map<String, String> createTokenRequestBody() {
+        Map<String, String> formParameters = new HashMap<>();
+        formParameters.put("grant_type", "client_credentials");
+        formParameters.put("client_id", clientId);
+        formParameters.put("client_secret", clientSecret);
+        return formParameters;
     }
 
     private String parseTokenFromResponse(String response) {
-        // Implement your custom token parsing logic here
-        return response; // Modify this to extract the actual token
-    }
-
-    @Bean
-    public OAuth2AccessTokenResponseClient<OAuth2ClientCredentialsGrantRequest> accessTokenResponseClient(WebClient customWebClient) {
-        DefaultClientCredentialsTokenResponseClient tokenResponseClient = new DefaultClientCredentialsTokenResponseClient();
-        tokenResponseClient.setWebClient(customWebClient);
-        return tokenResponseClient;
+        // Implement your custom token parsing logic here using Jsoup
+        Document doc = Jsoup.parse(response);
+        // Assuming the token is in an element with id "token" (adjust this as needed)
+        Element tokenElement = doc.getElementById("token");
+        return tokenElement != null ? tokenElement.text() : null;
     }
 }
 
 
 
 
+
+
+
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.security.oauth2.client.endpoint.DefaultClientCredentialsTokenResponseClient;
-import org.springframework.security.oauth2.client.endpoint.OAuth2AccessTokenResponseClient;
-import org.springframework.security.oauth2.client.endpoint.OAuth2ClientCredentialsGrantRequest;
 import org.springframework.web.reactive.function.client.WebClient;
 
 @Configuration
-public class OAuth2ClientTokenResponseClientConfig {
+public class WebClientConfig {
+
+    private final OAuth2TokenService oAuth2TokenService;
+
+    @Autowired
+    public WebClientConfig(OAuth2TokenService oAuth2TokenService) {
+        this.oAuth2TokenService = oAuth2TokenService;
+    }
 
     @Bean
-    public OAuth2AccessTokenResponseClient<OAuth2ClientCredentialsGrantRequest> accessTokenResponseClient(WebClient customWebClient) {
-        DefaultClientCredentialsTokenResponseClient tokenResponseClient = new DefaultClientCredentialsTokenResponseClient();
-        tokenResponseClient.setWebClient(customWebClient);
-        return tokenResponseClient;
+    public WebClient webClient() {
+        return WebClient.builder()
+                .filter((request, next) -> oAuth2TokenService.getToken()
+                        .flatMap(token -> {
+                            request.headers().setBearerAuth(token);
+                            return next.exchange(request);
+                        }))
+                .build();
     }
 }
+
+
+
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webflux</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.jsoup</groupId>
+    <artifactId>jsoup</artifactId>
+    <version>1.14.3</version>
+</dependency>
